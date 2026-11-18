@@ -34,9 +34,7 @@ local showAimColorFov = true
 local showAimbotTarget = false
 local showAimColorTarget = false
 local targetPart, fovRadius, aimColorFovRadius = "Head", 150, 100
-local aimColorPrediction, aimColorStrength = 0.08, 0.75
-local recoilCompensation = 2
-local DISFARCE_PARTS = {"Head", "Torso", "HumanoidRootPart", "Left Arm", "Right Arm", "Left Leg", "Right Leg"}
+local aimColorPrediction, aimColorStrength = 0.08, 0.85
 local aimColorDisfarceEnabled, smoothingFactor, minimized, showFps, tpEnabled = false, 0.7, false, false, false
 local toggleKey, switchTargetKey = Enum.KeyCode.Insert, Enum.KeyCode.T
 local currentTitleColor = Color3.fromRGB(0, 50, 150)
@@ -71,6 +69,11 @@ local targetPartsList = {"Head", "HumanoidRootPart"}
 local currentTargetIndex = 1
 local aimbotTargetFrame = nil
 local aimbotTargetLabel = nil
+
+-- ===== VARIÁVEIS DE TRAVA DE ALVO (NOVAS) =====
+local aimbotLockedTarget = nil
+local aimColorLockedPart = nil
+local aimColorLockedPlayer = nil
 
 local fovFrame = nil
 local aimColorFovFrame = nil
@@ -775,6 +778,8 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if input.KeyCode == switchTargetKey then
         currentTargetIndex = currentTargetIndex % #targetPartsList + 1
         targetPart = targetPartsList[currentTargetIndex]
+        aimColorLockedPart = nil
+        aimColorLockedPlayer = nil
     end
     if tpEnabled and input.UserInputType == Enum.UserInputType.MouseButton1 then
         local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
@@ -1511,17 +1516,18 @@ local function getClosestPart(radius)
     return cp, cplr
 end
 
+-- ===== smoothTrackScreenPoint com dead zone maior (anti-tremor) =====
 local function smoothTrackScreenPoint(targetX, targetY, maxStep, accelMin, curveDiv)
     local mp = UserInputService:GetMouseLocation()
     local dx = targetX - mp.X
     local dy = targetY - mp.Y
     local dist = math.sqrt(dx * dx + dy * dy)
-    if dist <= 0.5 then return end
+    if dist <= 2 then return end
 
     local t = math.clamp(dist / curveDiv, 0, 1)
     local strength = math.max(accelMin, t)
     local step = math.min(dist, maxStep) * strength
-    if dist <= 3 then step = dist end
+    if dist <= 4 then step = dist end
 
     local nx = dx / dist
     local ny = dy / dist
@@ -1659,6 +1665,9 @@ Players.PlayerRemoving:Connect(function(p)
     hitboxOriginalSizes[p] = nil
 end)
 
+-- ============================================================
+-- RENDER STEPPED — Aimbot e AimColor corrigidos
+-- ============================================================
 RunService.RenderStepped:Connect(function()
     if not panelLoaded then return end
     local mousePos = UserInputService:GetMouseLocation()
@@ -1721,18 +1730,34 @@ RunService.RenderStepped:Connect(function()
     end
 
     local rmbDown = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    local lmbHeld = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
 
     -- ============================================================
-    -- AIMBOT (RMB) — IDÊNTICO AO ANGEL PROJECT
+    -- AIMBOT (RMB) — com trava de alvo (anti-tremor)
     -- ============================================================
     if aimbotEnabled and rmbDown and not overPanel then
         local target, tp = getClosestPart(fovRadius)
+
+        -- Trava no alvo atual se ele ainda está válido e no FOV
+        if aimbotLockedTarget and aimbotLockedTarget.Parent then
+            local lockedHum = aimbotLockedTarget.Parent:FindFirstChildOfClass("Humanoid")
+            if lockedHum and lockedHum.Health > 0 then
+                local lockPos, lockOn = Camera:WorldToViewportPoint(aimbotLockedTarget.Position)
+                local c = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+                local lockDist = (Vector2.new(lockPos.X, lockPos.Y) - c).Magnitude
+                if lockOn and lockDist <= fovRadius then
+                    target = aimbotLockedTarget
+                end
+            end
+        end
+
         if target then
+            aimbotLockedTarget = target
             local sp, on = Camera:WorldToViewportPoint(target.Position)
             if on then
-                local maxStep  = 60 * (1 - smoothingFactor * 0.7)
-                local accelMin = 0.5 * (1 - smoothingFactor * 0.5)
-                local curveDiv = 80
+                local maxStep  = 40 * (1 - smoothingFactor * 0.7)
+                local accelMin = 0.4 * (1 - smoothingFactor * 0.5)
+                local curveDiv = 120
                 smoothTrackScreenPoint(sp.X, sp.Y, maxStep, accelMin, curveDiv)
             end
             if showAimbotTarget and tp then
@@ -1742,39 +1767,48 @@ RunService.RenderStepped:Connect(function()
                 aimbotTargetFrame.Visible = false
             end
         else
+            aimbotLockedTarget = nil
             aimbotTargetFrame.Visible = false
         end
     else
-        if not (aimColorEnabled and lmbDown and showAimColorTarget) then
+        aimbotLockedTarget = nil
+        if not (aimColorEnabled and lmbHeld and showAimColorTarget) then
             aimbotTargetFrame.Visible = false
         end
     end
 
     -- ============================================================
-    -- AIMCOLOR (LMB) — IDÊNTICO AO ANGEL PROJECT
-    -- Usa DISFARCE_PARTS nos dois modos (normal e disfarce)
-    -- Força controlada pelo slider aimColorStrength
-    -- Predição via AssemblyLinearVelocity
+    -- AIMCOLOR (LMB) — respeita o T + trava de alvo
+    -- Usa IsMouseButtonPressed para não ser cancelado pelo auto-fire
     -- ============================================================
-    if aimColorEnabled and lmbDown and not overPanel then
+    if aimColorEnabled and lmbHeld and not overPanel then
         local mp = UserInputService:GetMouseLocation()
         local center = Vector2.new(mp.X, mp.Y)
         local closest, closestPlayer = nil, nil
         local shortest = aimColorFovRadius
 
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then
-                if not teamCheck or p.Team ~= LocalPlayer.Team then
-                    for _, pn in ipairs(DISFARCE_PARTS) do
-                        local part = p.Character:FindFirstChild(pn)
+        -- Tenta manter alvo travado (se ainda válido, no FOV e da mesma parte)
+        if aimColorLockedPart and aimColorLockedPart.Parent and aimColorLockedPlayer then
+            local hum = aimColorLockedPlayer.Character and aimColorLockedPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and aimColorLockedPart.Name == targetPart then
+                local lockPos, lockOn = Camera:WorldToViewportPoint(aimColorLockedPart.Position)
+                local lockDist = (Vector2.new(lockPos.X, lockPos.Y) - center).Magnitude
+                if lockOn and lockDist <= aimColorFovRadius then
+                    closest = aimColorLockedPart
+                    closestPlayer = aimColorLockedPlayer
+                end
+            end
+        end
+
+        -- Se não há trava, busca o mais próximo (só targetPart)
+        if not closest then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then
+                    if not teamCheck or p.Team ~= LocalPlayer.Team then
+                        local part = p.Character:FindFirstChild(targetPart)
                         if part and part:IsA("BasePart") then
                             if not wallCheck or isVisible(part) then
-                                local predictedPos = part.Position
-                                local root = p.Character:FindFirstChild("HumanoidRootPart")
-                                if root and root:IsA("BasePart") then
-                                    predictedPos = predictedPos + root.AssemblyLinearVelocity * aimColorPrediction
-                                end
-                                local pos, on = Camera:WorldToViewportPoint(predictedPos)
+                                local pos, on = Camera:WorldToViewportPoint(part.Position)
                                 if on then
                                     local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
                                     if d < shortest then
@@ -1788,16 +1822,12 @@ RunService.RenderStepped:Connect(function()
                     end
                 end
             end
+            aimColorLockedPart = closest
+            aimColorLockedPlayer = closestPlayer
         end
 
         if closest and closestPlayer then
-            local predictedPos = closest.Position
-            local root = closestPlayer.Character and closestPlayer.Character:FindFirstChild("HumanoidRootPart")
-            if root and root:IsA("BasePart") then
-                predictedPos = predictedPos + root.AssemblyLinearVelocity * aimColorPrediction
-            end
-
-            local sp, on = Camera:WorldToViewportPoint(predictedPos)
+            local sp, on = Camera:WorldToViewportPoint(closest.Position)
             if on then
                 if showAimColorTarget then
                     aimbotTargetFrame.Visible = true
@@ -1815,12 +1845,12 @@ RunService.RenderStepped:Connect(function()
                 if dist > 0.5 then
                     local maxStep, accelMin, curveDiv
                     if aimColorDisfarceEnabled then
-                        maxStep  = 22 * aimColorStrength
-                        accelMin = 0.30 * aimColorStrength
+                        maxStep  = 22
+                        accelMin = 0.30
                         curveDiv = 140
                     else
-                        maxStep  = 90 * aimColorStrength
-                        accelMin = 0.92 * aimColorStrength
+                        maxStep  = 90
+                        accelMin = 0.92
                         curveDiv = 35
                     end
 
@@ -1850,6 +1880,8 @@ RunService.RenderStepped:Connect(function()
             end
         end
     else
+        aimColorLockedPart = nil
+        aimColorLockedPlayer = nil
         if not (aimbotEnabled and rmbDown and showAimbotTarget) then
             aimbotTargetFrame.Visible = false
         end
